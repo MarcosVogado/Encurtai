@@ -1,0 +1,62 @@
+@inject HttpClient Http
+
+<div class="card">
+    <h1>Encurtaí ✂️</h1>
+    <p class="sub">Cole um link comprido e receba um curto.</p>
+
+    <input @bind="urlEntrada"
+           @bind:event="oninput"
+           placeholder="https://exemplo.com/pagina-bem-longa" />
+
+    <button @onclick="Encurtar" disabled="@carregando">
+        @(carregando ? "Encurtando..." : "Encurtar")
+    </button>
+
+    @if (!string.IsNullOrEmpty(erro))
+    {
+        <p class="erro">@erro</p>
+    }
+
+    @if (resultado is not null)
+    {
+        <p class="ok">
+            Link curto:
+            <a href="@resultado.UrlCurta" target="_blank">@resultado.UrlCurta</a>
+        </p>
+    }
+</div>
+
+@code {
+    private string urlEntrada = "";
+    private bool carregando;
+    private string? erro;
+    private EncurtarResposta? resultado;
+
+    private async Task Encurtar()
+    {
+        erro = null;
+        resultado = null;
+        carregando = true;
+
+        try
+        {
+            var resp = await Http.PostAsJsonAsync("/encurtar", new { url = urlEntrada });
+
+            if (resp.IsSuccessStatusCode)
+                resultado = await resp.Content.ReadFromJsonAsync<EncurtarResposta>();
+            else
+                erro = "Não foi possível encurtar. Confira se a URL é válida (http/https).";
+        }
+        catch
+        {
+            erro = "Erro ao falar com a API. Ela está rodando em http://localhost:5080?";
+        }
+        finally
+        {
+            carregando = false;
+        }
+    }
+
+    // Lê a resposta da API. A desserialização ignora maiúsc./minúsc. (padrão web).
+    public record EncurtarResposta(string Codigo, string UrlCurta);
+}

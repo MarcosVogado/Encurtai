@@ -1,0 +1,16 @@
+# Build do .NET
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# Higiene de segredos (bom hábito desde já, mesmo sem segredo aqui)
+.env
+*.pem
+appsettings.*.local.json
