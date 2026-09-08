@@ -1,6 +1,5 @@
 name: CI
 
-# Quando o pipeline dispara: em todo push na main e em todo Pull Request para a main.
 on:
   push:
     branches: [ main ]
@@ -9,7 +8,24 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest   # runner Linux; .NET roda liso aqui
+    runs-on: ubuntu-latest
+
+    # Mongo efêmero: nasce com o job, morre no fim. Nada disso vai pro repo.
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })' --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # A string aqui é genérica (localhost do container). Não é segredo.
+    env:
+      ConnectionStrings__Mongo: "mongodb://localhost:27017"
+      MONGO_TEST_CONNECTION: "mongodb://localhost:27017"
 
     steps:
       - name: Checkout do código
@@ -18,7 +34,7 @@ jobs:
       - name: Instalar o .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'   # fixa a versão -> build reprodutível
+          dotnet-version: '9.0.x'
 
       - name: Restaurar dependências
         run: dotnet restore
@@ -26,5 +42,5 @@ jobs:
       - name: Compilar (Release)
         run: dotnet build --configuration Release --no-restore
 
-      - name: Rodar os testes
+      - name: Rodar os testes (unitários + integração)
         run: dotnet test --configuration Release --no-build --verbosity normal

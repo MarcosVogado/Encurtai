@@ -113,3 +113,27 @@ Os itens 3–5 são a ponte direta para levar CI/CD ao seu projeto real com segu
   *publish* com AOT, não em build normal), rode: `dotnet workload install wasm-tools`.
 - Se o `dotnet restore` reclamar de versão de algum pacote de teste, é só ajustar os
   números no `Encurtai.Tests.csproj` para os que seu SDK oferecer.
+
+---
+
+## Banco de dados (MongoDB)
+
+O armazenamento é MongoDB. A connection string **nunca** fica no código —
+vem de configuração, e a origem muda por ambiente:
+
+### Seu dev (Atlas)
+Guarde a string do Atlas em user-secrets (fora do repo):
+
+    dotnet user-secrets init --project src/Encurtai.Api
+    dotnet user-secrets set "ConnectionStrings:Mongo" "SUA_STRING_DO_ATLAS" --project src/Encurtai.Api
+
+### Parceiro / offline (Docker local)
+Sem conta nenhuma, só subir um Mongo local:
+
+    docker run -d --name mongo-encurtai -p 27017:27017 mongo:7
+
+O default do appsettings.json já aponta pra localhost:27017 — funciona direto.
+
+### CI
+O pipeline sobe um Mongo efêmero (service container) e injeta a string por
+variável de ambiente. Nada a configurar.
