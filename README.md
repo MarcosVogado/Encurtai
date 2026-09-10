@@ -6,7 +6,7 @@ pipeline de verdade no GitHub Actions — e que rende uma boa peça de portfóli
 O app é simples de propósito: **a estrela é a esteira, não o encurtador.**
 
 **Stack:** .NET 9 · ASP.NET Core Minimal API · Blazor WebAssembly · xUnit · GitHub Actions
-// teste ruleset 2
+// teste ruleset 3
 ---
 
 ## O que ele faz
