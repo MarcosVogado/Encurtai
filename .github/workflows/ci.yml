@@ -2,15 +2,95 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: o CI só precisa ler o código. Sem este bloco, o workflow
+# herda o token amplo configurado no repositório.
+permissions:
+  contents: read
+
+# Push novo na mesma ref cancela o run anterior em vez de empilhar fila.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
 
 jobs:
-  build-and-test:
+  # ---------------------------------------------------------------------------
+  # Formatação: contrato é o .editorconfig da raiz.
+  # ---------------------------------------------------------------------------
+  formato:
+    name: Formatação
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+          cache: true
+          cache-dependency-path: "**/*.csproj"
+
+      - run: dotnet restore
+
+      - name: Verificar formatação
+        run: dotnet format --verify-no-changes --no-restore
+
+  # ---------------------------------------------------------------------------
+  # Testes unitários: SEM banco.
+  #
+  # Antes, unitários e integração rodavam juntos e os unitários dependiam de um
+  # MongoDB no ar sem precisar. O trait Category=Integration já existia no código
+  # e nunca era usado como filtro — agora é.
+  # ---------------------------------------------------------------------------
+  unitarios:
+    name: Testes unitários
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+          cache: true
+          cache-dependency-path: "**/*.csproj"
+
+      - run: dotnet restore
+
+      - run: dotnet build --configuration Release --no-restore
+
+      - name: Rodar testes unitários com cobertura
+        run: |
+          dotnet test \
+            --configuration Release \
+            --no-build \
+            --filter "Category!=Integration" \
+            --logger "trx;LogFileName=unitarios.trx" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults
+
+      - name: Publicar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testes-unitarios
+          path: ./TestResults
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Testes de integração: COM banco efêmero.
+  # ---------------------------------------------------------------------------
+  integracao:
+    name: Testes de integração
     runs-on: ubuntu-latest
 
-    # Mongo efêmero: nasce com o job, morre no fim. Nada disso vai pro repo.
     services:
       mongo:
         image: mongo:7
@@ -22,25 +102,124 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-    # A string aqui é genérica (localhost do container). Não é segredo.
     env:
-      ConnectionStrings__Mongo: "mongodb://localhost:27017"
+      # Mongo efêmero sem autenticação, acessível só pelo runner. Não é segredo.
       MONGO_TEST_CONNECTION: "mongodb://localhost:27017"
+      ConnectionStrings__Mongo: "mongodb://localhost:27017"
 
     steps:
-      - name: Checkout do código
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Instalar o .NET SDK
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: "9.0.x"
+          cache: true
+          cache-dependency-path: "**/*.csproj"
 
-      - name: Restaurar dependências
-        run: dotnet restore
+      - run: dotnet restore
 
-      - name: Compilar (Release)
-        run: dotnet build --configuration Release --no-restore
+      - run: dotnet build --configuration Release --no-restore
 
-      - name: Rodar os testes (unitários + integração)
-        run: dotnet test --configuration Release --no-build --verbosity normal
+      - name: Rodar testes de integração
+        run: |
+          dotnet test \
+            --configuration Release \
+            --no-build \
+            --filter "Category=Integration" \
+            --logger "trx;LogFileName=integracao.trx" \
+            --results-directory ./TestResults
+
+      - name: Publicar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testes-integracao
+          path: ./TestResults
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Varredura de segredo.
+  #
+  # O histórico está limpo hoje; este job existe para que continue limpo — e
+  # serve de evidência verde do item de gestão de segredos.
+  # ---------------------------------------------------------------------------
+  segredos:
+    name: Varredura de segredos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Histórico completo: segredo apagado num commit posterior continua
+          # recuperável e precisa ser detectado.
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Portão único do CI.
+  #
+  # O nome deste job precisa ser exatamente "build-and-test": é o status check
+  # que o ruleset da branch main exige. Antes desta entrega havia um job único
+  # com esse nome; ao separá-lo em cinco, o check exigido deixou de existir e o
+  # merge ficou bloqueado aguardando algo que nunca mais apareceria.
+  #
+  # Agregar num portão é melhor do que listar cinco checks no ruleset: os jobs
+  # podem ser renomeados, separados ou somados sem precisar de permissão de
+  # administrador para mexer na configuração do repositório.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: build-and-test
+    needs: [formato, unitarios, integracao, segredos, imagens]
+    # always() para que o portão também reprove quando um job falha ou é pulado,
+    # em vez de ser pulado junto e deixar o check pendente para sempre.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conferir o resultado dos jobs do CI
+        env:
+          RESULTADOS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Resultados recebidos: $RESULTADOS"
+          for r in $RESULTADOS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::Algum job do CI não passou (resultados: $RESULTADOS)."
+              exit 1
+            fi
+          done
+          echo "Todos os jobs do CI passaram."
+
+  # ---------------------------------------------------------------------------
+  # Valida que as imagens compilam em TODO PR, antes de qualquer publicação.
+  # Sem push: descobrir que o Dockerfile quebrou só no merge é tarde.
+  # ---------------------------------------------------------------------------
+  imagens:
+    name: Build das imagens
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nome: api
+            dockerfile: Dockerfile.api
+          - nome: web
+            dockerfile: Dockerfile.web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compilar ${{ matrix.nome }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: false
+          build-args: |
+            APP_VERSION=0.0.0-ci
+          cache-from: type=gha,scope=${{ matrix.nome }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.nome }}

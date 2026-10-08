@@ -1,0 +1,142 @@
+# Serve o Blazor WebAssembly e faz de porta de entrada única da aplicação.
+#
+# Três responsabilidades:
+#   1. entregar os estáticos do WASM;
+#   2. encaminhar /api/ para o container da API (deixa o tráfego same-origin,
+#      o que dispensa CORS em produção);
+#   3. encaminhar os links curtos (/{codigo}) para a API, para que o link
+#      encurtado funcione no MESMO endereço que o usuário já está usando.
+
+upstream encurtai_api {
+    # Substituido no start do container pelo envsubst da imagem oficial do nginx,
+    # a partir da variavel API_UPSTREAM. E o que permite a MESMA imagem servir ao
+    # docker-compose (api:8080) e ao Kubernetes (encurtai-api:8080) sem rebuild.
+    server ${API_UPSTREAM};
+}
+
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Serve a versão .gz pré-comprimida que o publish do Blazor já gera, quando
+    # o cliente aceita. Reduz muito a carga inicial do WASM.
+    gzip_static on;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json
+               application/wasm application/octet-stream image/svg+xml;
+    gzip_min_length 1024;
+
+    # Cabeçalhos de segurança básicos.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # ---------------------------------------------------------------------
+    # 1) API
+    # A barra final no proxy_pass remove o prefixo /api/:
+    # /api/encurtar  ->  http://api:8080/encurtar
+    # ---------------------------------------------------------------------
+    location /api/ {
+        proxy_pass http://encurtai_api/;
+        proxy_http_version 1.1;
+
+        # Sem estes headers a API monta a URL curta com o host interno do
+        # container. Encurtai:BaseUrl tem precedência, mas isto é a rede de
+        # segurança para quando ele não estiver definido.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    30s;
+    }
+
+    # Health da API exposto para diagnóstico (as probes do Kubernetes falam
+    # direto com o Service da API, não passam por aqui).
+    location = /api-health {
+        proxy_pass http://encurtai_api/health;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+
+    # ---------------------------------------------------------------------
+    # 2) Links curtos
+    # O código tem exatamente 6 caracteres alfanuméricos (RandomCodeGenerator).
+    # A expressão não casa com ponto, então nenhum arquivo estático é capturado.
+    # ---------------------------------------------------------------------
+    location ~ "^/[A-Za-z0-9]{6}$" {
+        proxy_pass http://encurtai_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        # Redirect do encurtador deve chegar ao navegador, não ser seguido aqui.
+        proxy_intercept_errors off;
+        proxy_redirect off;
+    }
+
+    # ---------------------------------------------------------------------
+    # 3) Estáticos do Blazor
+    # ---------------------------------------------------------------------
+
+    # default_type ACRESCENTA o tipo sem substituir o mapa de MIME herdado
+    # (um bloco `types` aninhado descartaria css/js e quebraria a página).
+    location ~ \.wasm$ {
+        default_type application/wasm;
+        add_header Cache-Control "public, max-age=3600";
+        # Repetido de propósito: em nginx, um add_header dentro de location
+        # SUBSTITUI os herdados do server — não soma. Sem esta repetição, as
+        # respostas abaixo sairiam sem os cabeçalhos de segurança.
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # Cache curto de propósito: um cache longo faria o navegador continuar
+    # executando a versão anterior do app depois de um deploy ou rollback.
+    location /_framework/ {
+        add_header Cache-Control "public, max-age=3600";
+        # Repetido de propósito: em nginx, um add_header dentro de location
+        # SUBSTITUI os herdados do server — não soma. Sem esta repetição, as
+        # respostas abaixo sairiam sem os cabeçalhos de segurança.
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # Precisa ser sempre revalidado: é o arquivo que aponta para a API e o que
+    # permite trocar de backend sem rebuild da imagem.
+    location = /appsettings.json {
+        add_header Cache-Control "no-cache, must-revalidate";
+        # Repetido de propósito: em nginx, um add_header dentro de location
+        # SUBSTITUI os herdados do server — não soma. Sem esta repetição, as
+        # respostas abaixo sairiam sem os cabeçalhos de segurança.
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        # Repetido de propósito: em nginx, um add_header dentro de location
+        # SUBSTITUI os herdados do server — não soma. Sem esta repetição, as
+        # respostas abaixo sairiam sem os cabeçalhos de segurança.
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # Fallback de SPA: qualquer rota desconhecida devolve o index.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

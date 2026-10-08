@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+
+# =============================================================================
+# Encurtai.Web — Blazor WebAssembly
+#
+# O publish deste projeto gera ARQUIVOS ESTÁTICOS (wwwroot), não um processo
+# .NET: por isso a imagem final é nginx, e não um runtime ASP.NET. É também por
+# isso que são duas imagens e não uma.
+#
+# Build com contexto na RAIZ do repositório (docker build -f Dockerfile.web .).
+# =============================================================================
+
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS restore
+WORKDIR /src
+
+COPY global.json Directory.Build.props Encurtai.sln ./
+COPY src/Encurtai.Api/Encurtai.Api.csproj src/Encurtai.Api/
+COPY src/Encurtai.Web/Encurtai.Web.csproj src/Encurtai.Web/
+COPY tests/Encurtai.Tests/Encurtai.Tests.csproj tests/Encurtai.Tests/
+
+RUN dotnet restore src/Encurtai.Web/Encurtai.Web.csproj
+
+FROM restore AS publish
+ARG APP_VERSION=0.0.0
+
+COPY src/Encurtai.Web/ src/Encurtai.Web/
+
+# Se este publish falhar pedindo o workload wasm-tools (necessário só para AOT
+# ou relink nativo), descomente a linha abaixo. Mantido fora por padrão porque
+# instalar o workload é o passo mais lento da imagem.
+# RUN dotnet workload install wasm-tools
+
+RUN dotnet publish src/Encurtai.Web/Encurtai.Web.csproj \
+    --configuration Release \
+    --no-restore \
+    --output /publish \
+    -p:Version=${APP_VERSION}
+
+# -----------------------------------------------------------------------------
+# Runtime: nginx sem privilégio (escuta em 8080 e roda como uid 101).
+# A imagem nginx padrão sobe como root na 80; esta não.
+# -----------------------------------------------------------------------------
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS final
+
+ARG APP_VERSION=0.0.0
+LABEL org.opencontainers.image.title="encurtai-web" \
+      org.opencontainers.image.description="Frontend Blazor WebAssembly do Encurtai" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.source="https://github.com/MarcosVogado/Encurtai" \
+      org.opencontainers.image.licenses="MIT"
+
+# Vai para templates/, nao conf.d/: o entrypoint da imagem oficial roda envsubst
+# nos templates e escreve o resultado em conf.d/ a cada start do container.
+COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=publish /publish/wwwroot /usr/share/nginx/html
+
+# Endereco da API, resolvido no start. Sobrescrito no k8s para encurtai-api:8080.
+ENV API_UPSTREAM=api:8080
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q -O - http://127.0.0.1:8080/ > /dev/null || exit 1

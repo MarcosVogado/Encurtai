@@ -1,0 +1,18 @@
+# Normaliza quebras de linha no repositório independentemente do core.autocrlf
+# de cada máquina. Sem isso, `dotnet format --verify-no-changes` no runner Linux
+# pode reprovar código que passa no Windows — uma falha de CI que não tem nada a
+# ver com o código.
+* text=auto eol=lf
+
+# Binários: nunca converter.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.dll binary
+*.wasm binary
+
+# Script de shell precisa de LF até no Windows, senão não executa em container.
+*.sh text eol=lf

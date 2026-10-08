@@ -1,0 +1,86 @@
+# Frontend Blazor WebAssembly servido por nginx, que também é a porta de entrada:
+# encaminha /api/ e os links curtos para o Service da API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encurtai-web
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: web
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: encurtai
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: encurtai
+        app.kubernetes.io/component: web
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: web
+          image: __IMAGE_WEB__
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # A MESMA imagem serve ao compose (api:8080) e aqui, só mudando esta
+            # variável: o entrypoint do nginx reescreve o upstream no start.
+            - name: API_UPSTREAM
+              value: encurtai-api:8080
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: encurtai-web
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: web
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      # Porta fixa para o smoke test do pipeline alcançar o cluster kind.
+      nodePort: 30080

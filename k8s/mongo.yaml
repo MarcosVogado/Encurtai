@@ -1,0 +1,102 @@
+# MongoDB para o ambiente de homologação.
+#
+# Deployment + PVC (e não StatefulSet) de propósito: é uma instância única de
+# homologação, não um replica set. Para produção de verdade seria StatefulSet
+# com volumeClaimTemplates, ou um serviço gerenciado como o Atlas.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: encurtai-mongo-data
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: mongo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encurtai-mongo
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: mongo
+spec:
+  replicas: 1
+  strategy:
+    # Volume ReadWriteOnce não pode ser montado por dois pods ao mesmo tempo:
+    # o pod antigo tem que morrer antes do novo nascer.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: encurtai
+      app.kubernetes.io/component: mongo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: encurtai
+        app.kubernetes.io/component: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          ports:
+            - name: mongo
+              containerPort: 27017
+          env:
+            # Valores vêm do Secret criado pelo pipeline. Nenhuma credencial
+            # aparece neste arquivo versionado.
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: encurtai-secrets
+                  key: mongo-user
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: encurtai-secrets
+                  key: mongo-password
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - db.runCommand({ping:1}).ok
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: encurtai-mongo-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: encurtai-mongo
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: mongo
+spec:
+  selector:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo

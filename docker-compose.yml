@@ -1,0 +1,114 @@
+# =============================================================================
+# Encurtai — orquestração local completa
+#
+#   docker compose up -d --build
+#   → aplicação em http://localhost:8080  (UI, /api/ e links curtos)
+#   → API direta  em http://localhost:5080 (health, diagnóstico)
+#
+# Nenhuma credencial aqui: tudo vem do .env (não versionado). Veja .env.example.
+# =============================================================================
+
+name: encurtai
+
+services:
+  # ---------------------------------------------------------------------------
+  # Banco de dados
+  # ---------------------------------------------------------------------------
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?defina MONGO_ROOT_USER no .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?defina MONGO_ROOT_PASSWORD no .env}
+    volumes:
+      # Volume nomeado: sem ele, todo link encurtado morre no primeiro
+      # `docker compose down`.
+      - mongo-data:/data/db
+    # Sem `ports`: o banco é alcançável só pela rede interna do compose.
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Cache de leitura
+  #
+  # Não é enfeite: GET /{codigo} é a operação quente de um encurtador e o acesso
+  # é muito desbalanceado (poucos links concentram os cliques). O CachedUrlStore
+  # resolve esses pela memória do Redis. Se este serviço sair do ar, a API
+  # degrada para o Mongo sozinha — cache custa desempenho, não disponibilidade.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Cache puro: persistência desligada de propósito. A fonte da verdade é o Mongo.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        APP_VERSION: ${IMAGE_TAG:-dev}
+    image: ${REGISTRY:-ghcr.io/marcosvogado}/encurtai-api:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Mongo: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      Mongo__Database: ${MONGO_DATABASE:-encurtai}
+      ConnectionStrings__Redis: redis:6379
+      # Endereço PÚBLICO da aplicação. É o que faz o link curto devolvido apontar
+      # para onde o usuário realmente acessa, e não para o host interno do container.
+      Encurtai__BaseUrl: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      # Chave de demonstração do fluxo de rollback (ver docs/rollback.md).
+      Encurtai__SimularFalhaDeReadiness: ${SIMULAR_FALHA:-false}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      # Exposta para inspecionar /health e /health/ready direto.
+      - "${API_PORT:-5080}:8080"
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Frontend + porta de entrada
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        APP_VERSION: ${IMAGE_TAG:-dev}
+    image: ${REGISTRY:-ghcr.io/marcosvogado}/encurtai-web:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      API_UPSTREAM: api:8080
+    depends_on:
+      api:
+        # Usa o HEALTHCHECK declarado no Dockerfile.api. Sem isso o nginx sobe
+        # antes da API existir e falha ao resolver o upstream.
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  mongo-data:

@@ -4,13 +4,29 @@ obj/
 [Bb]in/
 [Oo]bj/
 
+# Resultados de teste e cobertura
+TestResults/
+*.trx
+coverage.*.xml
+coverage.cobertura.xml
+
 # Visual Studio / Rider
 .vs/
 .idea/
 *.user
 *.suo
 
-# Higiene de segredos (bom hábito desde já, mesmo sem segredo aqui)
+# Higiene de segredos
+# `.env` sozinho não cobria .env.local nem .env.production — agora cobre tudo,
+# menos o exemplo, que precisa ser versionado.
 .env
+.env.*
+!.env.example
 *.pem
+*.pfx
+*.key
+secrets.json
 appsettings.*.local.json
+
+# Evidências geradas localmente (as da entrega ficam em docs/)
+evidencias/

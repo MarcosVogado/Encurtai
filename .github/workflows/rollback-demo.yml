@@ -1,0 +1,352 @@
+name: Evidencia de rollback
+
+# Produz a evidencia executada que o item 5 da entrega pede: uma falha
+# provocada de proposito, o rollout sendo barrado, e a reversao.
+#
+# Por que um workflow separado do CD: o CD cria um cluster kind do zero a cada
+# execucao, entao o Deployment nasce com UMA unica revisao e "kubectl rollout
+# undo" nao tem para onde voltar. Uma demonstracao honesta precisa de DOIS
+# deploys sequenciais no MESMO cluster, dentro da MESMA execucao -- que e
+# exatamente o que este workflow faz.
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versao ja publicada no registry para usar como versao boa (ex: 1.1.0)"
+        required: true
+        default: "1.1.0"
+# Sem gatilho de push de proposito.
+#
+# Havia um, com filtro de paths, para a demonstracao se auto-testar. Mas o filtro
+# casa com QUALQUER push cujo conjunto de commits inclua este arquivo, e o
+# workflow depende do Environment 'homologacao' e dos tres segredos -- que so
+# existem onde alguem com permissao de administrador os cadastrou. No
+# repositorio principal ele falhava na primeira verificacao, deixando um X
+# vermelho que nao dizia nada sobre o codigo.
+#
+# Disparo manual exige que o arquivo esteja na branch padrao do repositorio.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rollback-demo-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  NS: encurtai-rollback
+  BASE_URL_PUBLICA: http://encurtai.rollback.local
+
+jobs:
+  demonstrar:
+    name: Provocar falha e reverter
+    runs-on: ubuntu-latest
+    environment: homologacao
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conferir segredos do ambiente
+        env:
+          MONGO_USER: ${{ secrets.MONGO_USER }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          MONGO_CONNECTION_STRING: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          set -uo pipefail
+          if [ -z "${MONGO_CONNECTION_STRING:-}" ] || [ -z "${MONGO_USER:-}" ] || [ -z "${MONGO_PASSWORD:-}" ]; then
+            echo "::error::Environment 'homologacao' sem os tres segredos. Veja docs/segredos.md."
+            exit 1
+          fi
+          echo "Segredos presentes."
+
+      - name: Autenticar no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolver a imagem publicada por digest
+        id: img
+        env:
+          VERSAO: ${{ inputs.versao || '1.1.0' }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          prefixo="${REGISTRY}/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+
+          # Mesma disciplina do CD: implanta por digest, nao por tag.
+          api=$(docker buildx imagetools inspect "$prefixo/encurtai-api:$VERSAO" --format '{{.Manifest.Digest}}')
+          web=$(docker buildx imagetools inspect "$prefixo/encurtai-web:$VERSAO" --format '{{.Manifest.Digest}}')
+
+          echo "api=$prefixo/encurtai-api@$api" >> "$GITHUB_OUTPUT"
+          echo "web=$prefixo/encurtai-web@$web" >> "$GITHUB_OUTPUT"
+          echo "versao=$VERSAO" >> "$GITHUB_OUTPUT"
+
+          echo "Versao boa: $VERSAO"
+          echo "  api: $prefixo/encurtai-api@$api"
+          echo "  web: $prefixo/encurtai-web@$web"
+
+      - name: Criar cluster kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: encurtai-rollback
+          node_image: kindest/node:v1.31.0
+
+      - name: Preparar namespace, segredos e configuracao
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATOR: ${{ github.actor }}
+          MONGO_USER: ${{ secrets.MONGO_USER }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          MONGO_CONNECTION_STRING: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret docker-registry ghcr-pull --namespace "$NS" \
+            --docker-server="${REGISTRY}" \
+            --docker-username="${ATOR}" \
+            --docker-password="${GHCR_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic encurtai-secrets --namespace "$NS" \
+            --from-literal=mongo-user="$MONGO_USER" \
+            --from-literal=mongo-password="$MONGO_PASSWORD" \
+            --from-literal=mongo-connection-string="$MONGO_CONNECTION_STRING" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create configmap encurtai-config --namespace "$NS" \
+            --from-literal=public-base-url="$BASE_URL_PUBLICA" \
+            --from-literal=simular-falha-readiness="false" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: ATO 1 — implantar a versao boa
+        env:
+          IMAGE_API: ${{ steps.img.outputs.api }}
+          IMAGE_WEB: ${{ steps.img.outputs.web }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/manifestos evidencias
+          cp k8s/*.yaml /tmp/manifestos/
+          sed -i "s|__IMAGE_API__|${IMAGE_API}|g" /tmp/manifestos/api.yaml
+          sed -i "s|__IMAGE_WEB__|${IMAGE_WEB}|g" /tmp/manifestos/web.yaml
+          kubectl apply --namespace "$NS" -f /tmp/manifestos/
+
+          kubectl rollout status deployment/encurtai-mongo --namespace "$NS" --timeout=240s
+          kubectl rollout status deployment/encurtai-redis --namespace "$NS" --timeout=120s
+          kubectl rollout status deployment/encurtai-api   --namespace "$NS" --timeout=240s
+          kubectl rollout status deployment/encurtai-web   --namespace "$NS" --timeout=240s
+
+          echo "--- estado saudavel ---" | tee evidencias/1-estado-saudavel.txt
+          kubectl get deploy,rs,pod --namespace "$NS" -o wide | tee -a evidencias/1-estado-saudavel.txt
+          echo "" | tee -a evidencias/1-estado-saudavel.txt
+          echo "--- historico de revisoes ---" | tee -a evidencias/1-estado-saudavel.txt
+          kubectl rollout history deployment/encurtai-api --namespace "$NS" | tee -a evidencias/1-estado-saudavel.txt
+
+      - name: ATOS 2 a 4 — provocar a falha, provar o bloqueio e reverter
+        id: demo
+        env:
+          VERSAO_BOA: ${{ steps.img.outputs.versao }}
+        run: |
+          # Sem -e de proposito: o rollout VAI falhar, e essa falha e o objeto
+          # da demonstracao -- nao pode abortar o passo.
+          set -uo pipefail
+
+          porta=18080
+          kubectl port-forward --namespace "$NS" service/encurtai-api "$porta":8080 > /tmp/pf.log 2>&1 &
+          pf=$!
+          trap 'kill $pf 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null -m 2 "http://localhost:$porta/health" && break
+            sleep 2
+          done
+
+          endpoints() {
+            kubectl get endpoints encurtai-api --namespace "$NS" \
+              -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{"\n"}{end}' 2>/dev/null | sort
+          }
+
+          versao_no_ar() {
+            curl -fsS -m 5 "http://localhost:$porta/health" 2>/dev/null | jq -r .versao 2>/dev/null
+          }
+
+          # ---------- ATO 1 (registro) ----------
+          antes=$(versao_no_ar)
+          eps_antes=$(endpoints)
+          {
+            echo "ATO 1 — versao boa no ar"
+            echo "  versao reportada por /health: $antes"
+            echo "  endpoints prontos do Service encurtai-api:"
+            echo "$eps_antes" | sed 's/^/    /'
+          } | tee evidencias/2-antes.txt
+
+          # ---------- ATO 2: provocar a falha ----------
+          # kubectl set env altera o POD TEMPLATE, criando uma revisao nova de
+          # verdade. Alterar so o ConfigMap nao criaria revisao -- e o rollback
+          # nao teria o que desfazer.
+          {
+            echo ""
+            echo "ATO 2 — implantando uma versao que nao fica pronta"
+            echo "  acao: Encurtai__SimularFalhaDeReadiness=true no pod template"
+          } | tee evidencias/3-falha.txt
+
+          kubectl set env deployment/encurtai-api --namespace "$NS" \
+            Encurtai__SimularFalhaDeReadiness=true 2>&1 | tee -a evidencias/3-falha.txt
+
+          echo "  aguardando o rollout (deve estourar o timeout)..." | tee -a evidencias/3-falha.txt
+          inicio=$(date +%s)
+          if kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=90s \
+               >> evidencias/3-falha.txt 2>&1; then
+            echo "::error::O rollout convergiu. A falha nao foi provocada -- demonstracao invalida."
+            echo "convergiu=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          fim=$(date +%s)
+          echo "  rollout NAO convergiu em $((fim-inicio))s, como esperado." | tee -a evidencias/3-falha.txt
+
+          # ---------- ATO 3: provar que o trafego nunca chegou na versao ruim ----------
+          {
+            echo ""
+            echo "ATO 3 — prova de que a versao quebrada nunca recebeu trafego"
+            echo ""
+            echo "  pods (os novos ficam Running mas 0/1 READY):"
+          } | tee evidencias/4-bloqueio.txt
+          kubectl get pods --namespace "$NS" -l app.kubernetes.io/component=api \
+            -o custom-columns='NOME:.metadata.name,IP:.status.podIP,FASE:.status.phase,PRONTO:.status.containerStatuses[0].ready' \
+            | tee -a evidencias/4-bloqueio.txt
+
+          echo "" | tee -a evidencias/4-bloqueio.txt
+          echo "  ReplicaSets (o novo tem 0 prontos):" | tee -a evidencias/4-bloqueio.txt
+          kubectl get rs --namespace "$NS" -l app.kubernetes.io/component=api \
+            -o custom-columns='NOME:.metadata.name,DESEJADO:.spec.replicas,PRONTOS:.status.readyReplicas' \
+            | tee -a evidencias/4-bloqueio.txt
+
+          # jq em vez de jsonpath: filtro booleano no jsonpath do kubectl e
+          # inconsistente entre versoes, e um filtro silenciosamente vazio aqui
+          # transformaria a prova central num falso positivo.
+          ips_nao_prontos=$(kubectl get pods --namespace "$NS" -l app.kubernetes.io/component=api -o json \
+            | jq -r '.items[] | select(any(.status.containerStatuses[]?; .ready == false)) | .status.podIP // empty' \
+            | sort -u | sed '/^$/d')
+          eps_durante=$(endpoints)
+
+          {
+            echo ""
+            echo "  IPs dos pods NAO prontos (a versao quebrada):"
+            echo "${ips_nao_prontos:-  (nenhum)}" | sed 's/^/    /'
+            echo ""
+            echo "  endpoints prontos do Service durante a falha:"
+            echo "$eps_durante" | sed 's/^/    /'
+          } | tee -a evidencias/4-bloqueio.txt
+
+          # A prova central: nenhum IP nao-pronto aparece entre os endpoints.
+          vazou=0
+          for ip in $ips_nao_prontos; do
+            if printf '%s\n' "$eps_durante" | grep -qx "$ip"; then
+              echo "::error::O pod nao-pronto $ip ESTA entre os endpoints do Service."
+              vazou=1
+            fi
+          done
+          if [ "$vazou" -eq 0 ]; then
+            echo "" | tee -a evidencias/4-bloqueio.txt
+            echo "  PROVADO: nenhum pod nao-pronto entrou no balanceamento." | tee -a evidencias/4-bloqueio.txt
+          fi
+
+          durante=$(versao_no_ar)
+          echo "  versao atendendo DURANTE a falha: $durante" | tee -a evidencias/4-bloqueio.txt
+
+          echo "" | tee -a evidencias/4-bloqueio.txt
+          echo "  readinessProbe reprovando:" | tee -a evidencias/4-bloqueio.txt
+          kubectl describe pods --namespace "$NS" -l app.kubernetes.io/component=api 2>/dev/null \
+            | grep -iE "Readiness probe failed|Warning  Unhealthy" | head -5 | sed 's/^/    /' \
+            | tee -a evidencias/4-bloqueio.txt
+
+          # ---------- ATO 4: reverter ----------
+          {
+            echo ""
+            echo "ATO 4 — revertendo"
+            echo ""
+            echo "  historico antes da reversao:"
+          } | tee evidencias/5-reversao.txt
+          kubectl rollout history deployment/encurtai-api --namespace "$NS" | tee -a evidencias/5-reversao.txt
+
+          kubectl rollout undo deployment/encurtai-api --namespace "$NS" 2>&1 | tee -a evidencias/5-reversao.txt
+          kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=180s 2>&1 | tee -a evidencias/5-reversao.txt
+
+          depois=$(versao_no_ar)
+          {
+            echo ""
+            echo "  historico depois da reversao:"
+          } | tee -a evidencias/5-reversao.txt
+          kubectl rollout history deployment/encurtai-api --namespace "$NS" | tee -a evidencias/5-reversao.txt
+          kubectl get pods --namespace "$NS" -l app.kubernetes.io/component=api \
+            -o custom-columns='NOME:.metadata.name,FASE:.status.phase,PRONTO:.status.containerStatuses[0].ready' \
+            | tee -a evidencias/5-reversao.txt
+
+          echo "" | tee -a evidencias/5-reversao.txt
+          echo "  versao no ar depois da reversao: $depois" | tee -a evidencias/5-reversao.txt
+
+          # Confirma que o encurtador voltou a funcionar de ponta a ponta.
+          resposta=$(curl -fsS -m 10 -X POST "http://localhost:$porta/encurtar" \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://ceub.br/evidencia-rollback"}' 2>/dev/null)
+          codigo=$(printf '%s' "$resposta" | jq -r .codigo 2>/dev/null)
+          destino=$(curl -fsS -o /dev/null -w '%{redirect_url}' -m 10 "http://localhost:$porta/$codigo" 2>/dev/null)
+          {
+            echo "  encurtou apos a reversao: $resposta"
+            echo "  redirect resolveu para:   $destino"
+          } | tee -a evidencias/5-reversao.txt
+
+          # ---------- veredito ----------
+          ok=1
+          [ "$antes" = "$VERSAO_BOA" ]   || { echo "::error::versao inicial era '$antes', esperada '$VERSAO_BOA'"; ok=0; }
+          [ "$durante" = "$VERSAO_BOA" ] || { echo "::error::durante a falha atendeu '$durante'"; ok=0; }
+          [ "$depois" = "$VERSAO_BOA" ]  || { echo "::error::apos reverter atendeu '$depois'"; ok=0; }
+          [ "$vazou" -eq 0 ]             || ok=0
+          [ -n "$ips_nao_prontos" ]      || { echo "::error::nenhum pod ficou nao-pronto; a falha nao foi provocada"; ok=0; }
+          [ "$destino" = "https://ceub.br/evidencia-rollback" ] || { echo "::error::redirect pos-reversao devolveu '$destino'"; ok=0; }
+
+          {
+            echo "## Evidencia de rollback"
+            echo ""
+            echo "| Momento | Versao atendendo | Observacao |"
+            echo "|---|---|---|"
+            echo "| Antes | \`$antes\` | duas replicas prontas |"
+            echo "| Durante a falha | \`$durante\` | pod novo Running mas 0/1 READY, fora dos endpoints |"
+            echo "| Depois da reversao | \`$depois\` | rollout undo concluido |"
+            echo ""
+            echo "- Rollout da versao quebrada **nao convergiu** (timeout de 90s)."
+            echo "- Nenhum pod nao-pronto entrou nos endpoints do Service."
+            echo "- Encurtador voltou a funcionar: \`$codigo\` -> \`$destino\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::A demonstracao nao satisfez todas as verificacoes."
+            exit 1
+          fi
+          echo "Demonstracao completa e verificada."
+
+      - name: Consolidar evidencias
+        if: always()
+        run: |
+          set +e
+          mkdir -p evidencias
+          kubectl get all --namespace "$NS" -o wide        > evidencias/9-recursos.txt 2>&1
+          kubectl get events --namespace "$NS" --sort-by=.lastTimestamp > evidencias/9-eventos.txt 2>&1
+          kubectl logs -l app.kubernetes.io/component=api --namespace "$NS" \
+            --tail=200 --all-containers                   > evidencias/9-logs-api.txt 2>&1
+          cat evidencias/[1-5]-*.txt                      > evidencias/0-relatorio-completo.txt 2>&1
+          ls -la evidencias/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidencia-rollback-${{ github.run_number }}
+          path: evidencias
+          retention-days: 90

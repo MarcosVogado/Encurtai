@@ -1,0 +1,571 @@
+name: CD
+
+# Tres gatilhos, tres propositos:
+#   push em main  -> publica imagem de desenvolvimento e implanta em homologacao
+#   tag v*        -> publica release versionada e habilita o caminho de producao
+#   manual        -> implanta de novo uma versao JA PUBLICADA (rollback), sem rebuild
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      reimplantar_tag:
+        description: "Tag ja publicada para reimplantar (ex: v1.0.0). Vazio = compila do commit atual."
+        required: false
+        type: string
+      ambiente:
+        description: "Ambiente de destino"
+        required: true
+        default: homologacao
+        type: choice
+        options: [homologacao, producao]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deploys nao podem se sobrepor, e cancelar um deploy pela metade deixa o
+  # cluster num estado misto -- por isso cancel-in-progress e false aqui.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ===========================================================================
+  # 1. Decide qual imagem vai ser implantada: compila uma nova ou localiza
+  #    uma ja publicada (caminho de rollback).
+  # ===========================================================================
+  imagens:
+    name: Imagens
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Escopo minimo e concedido SO neste job: e o unico que escreve no registry.
+      packages: write
+    outputs:
+      api: ${{ steps.referencias.outputs.api }}
+      web: ${{ steps.referencias.outputs.web }}
+      versao: ${{ steps.contexto.outputs.versao }}
+      modo: ${{ steps.contexto.outputs.modo }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determinar versao e modo
+        id: contexto
+        env:
+          REIMPLANTAR_TAG: ${{ inputs.reimplantar_tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # GHCR exige o namespace em minusculas; o login do GitHub pode ter maiusculas.
+          prefixo="${REGISTRY}/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "prefixo=$prefixo" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${REIMPLANTAR_TAG:-}" ]; then
+            echo "modo=rollback" >> "$GITHUB_OUTPUT"
+            echo "versao=${REIMPLANTAR_TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${REIMPLANTAR_TAG}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Modo rollback: reimplantando ${REIMPLANTAR_TAG} sem recompilar."
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "modo=build" >> "$GITHUB_OUTPUT"
+            echo "versao=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            # Pre-release rastreavel ate o run que a produziu.
+            echo "modo=build" >> "$GITHUB_OUTPUT"
+            echo "versao=0.0.0-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "tag=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Autenticar no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Token efemero do proprio run: NENHUM segredo de registry e cadastrado
+          # a mao. E o escopo packages:write declarado acima que o habilita.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Metadados da imagem da API
+        id: meta_api
+        if: steps.contexto.outputs.modo == 'build'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.contexto.outputs.prefixo }}/encurtai-api
+          # Versionamento semantico: de v1.2.3 saem 1.2.3, 1.2 e 1, para quem
+          # quiser acompanhar so correcoes ou so a minor.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.contexto.outputs.versao }}
+
+      - name: Metadados da imagem do Web
+        id: meta_web
+        if: steps.contexto.outputs.modo == 'build'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.contexto.outputs.prefixo }}/encurtai-web
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.contexto.outputs.versao }}
+
+      - name: Publicar imagem da API
+        id: build_api
+        if: steps.contexto.outputs.modo == 'build'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ${{ steps.meta_api.outputs.tags }}
+          labels: ${{ steps.meta_api.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.contexto.outputs.versao }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+          provenance: true
+          sbom: true
+
+      - name: Publicar imagem do Web
+        id: build_web
+        if: steps.contexto.outputs.modo == 'build'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: ${{ steps.meta_web.outputs.tags }}
+          labels: ${{ steps.meta_web.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.contexto.outputs.versao }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+          provenance: true
+          sbom: true
+
+      - name: Resolver referencias por digest
+        id: referencias
+        env:
+          PREFIXO: ${{ steps.contexto.outputs.prefixo }}
+          MODO: ${{ steps.contexto.outputs.modo }}
+          TAG: ${{ steps.contexto.outputs.tag }}
+          VERSAO: ${{ steps.contexto.outputs.versao }}
+          DIGEST_API_BUILD: ${{ steps.build_api.outputs.digest }}
+          DIGEST_WEB_BUILD: ${{ steps.build_web.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MODO" = "build" ]; then
+            digest_api="$DIGEST_API_BUILD"
+            digest_web="$DIGEST_WEB_BUILD"
+          else
+            # Rollback: descobre o digest da tag pedida sem baixar a imagem.
+            digest_api=$(docker buildx imagetools inspect "$PREFIXO/encurtai-api:$TAG" --format '{{.Manifest.Digest}}')
+            digest_web=$(docker buildx imagetools inspect "$PREFIXO/encurtai-web:$TAG" --format '{{.Manifest.Digest}}')
+          fi
+
+          # O deploy referencia o DIGEST, nao a tag: tag e ponteiro que alguem
+          # pode mover, digest e imutavel. Sem isso, "rollback para v1.0.0" nao
+          # garante o mesmo binario de antes.
+          echo "api=$PREFIXO/encurtai-api@$digest_api" >> "$GITHUB_OUTPUT"
+          echo "web=$PREFIXO/encurtai-web@$digest_web" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Imagens desta execucao"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Modo | \`$MODO\` |"
+            echo "| Versao | \`$VERSAO\` |"
+            echo "| API | \`$PREFIXO/encurtai-api@$digest_api\` |"
+            echo "| Web | \`$PREFIXO/encurtai-web@$digest_web\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # 2. Homologacao: cluster kind descartavel, deploy real, smoke test real.
+  # ===========================================================================
+  homologacao:
+    name: Deploy em homologacao
+    needs: imagens
+    # Interruptor explicito do deploy.
+    #
+    # Os jobs de deploy dependem do Environment 'homologacao' e dos tres
+    # segredos, que so existem onde alguem com permissao de administrador os
+    # cadastrou. Sem este guarda, o merge na main de um repositorio sem eles
+    # produziria uma falha vermelha que nao diz nada sobre o codigo.
+    #
+    # Para habilitar: Settings > Secrets and variables > Actions > Variables,
+    # crie CD_DEPLOY_HABILITADO = true. Sem a variavel, o job fica PULADO
+    # (cinza), nao reprovado.
+    if: |
+      vars.CD_DEPLOY_HABILITADO == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.ambiente == 'homologacao')
+    runs-on: ubuntu-latest
+    environment: homologacao
+    permissions:
+      contents: read
+      packages: read
+    env:
+      NS: encurtai-homologacao
+      BASE_URL_PUBLICA: http://encurtai.homologacao.local
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conferir segredos do ambiente
+        env:
+          MONGO_USER: ${{ secrets.MONGO_USER }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          MONGO_CONNECTION_STRING: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          set -uo pipefail
+          faltando=""
+          if [ -z "${MONGO_USER:-}" ]; then faltando="$faltando MONGO_USER"; fi
+          if [ -z "${MONGO_PASSWORD:-}" ]; then faltando="$faltando MONGO_PASSWORD"; fi
+          if [ -z "${MONGO_CONNECTION_STRING:-}" ]; then faltando="$faltando MONGO_CONNECTION_STRING"; fi
+
+          if [ -n "$faltando" ]; then
+            echo "::error::Segredos ausentes no Environment 'homologacao':$faltando"
+            echo "Cadastre em Settings > Environments > homologacao > Secrets."
+            echo "Formato esperado em docs/segredos.md."
+            exit 1
+          fi
+          echo "Segredos presentes."
+
+      - name: Criar cluster kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: encurtai
+          node_image: kindest/node:v1.31.0
+
+      - name: Criar namespace
+        run: kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Criar segredo de pull do GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          # Permite baixar imagem PRIVADA do GHCR sem tornar o pacote publico.
+          kubectl create secret docker-registry ghcr-pull \
+            --namespace "$NS" \
+            --docker-server="${REGISTRY}" \
+            --docker-username="${ATOR}" \
+            --docker-password="${GHCR_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Criar segredos da aplicacao
+        env:
+          MONGO_USER: ${{ secrets.MONGO_USER }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          MONGO_CONNECTION_STRING: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          set -euo pipefail
+          # `--dry-run=client | kubectl apply` e idempotente E nao materializa o
+          # valor em arquivo no disco do runner nem no log.
+          kubectl create secret generic encurtai-secrets \
+            --namespace "$NS" \
+            --from-literal=mongo-user="$MONGO_USER" \
+            --from-literal=mongo-password="$MONGO_PASSWORD" \
+            --from-literal=mongo-connection-string="$MONGO_CONNECTION_STRING" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Criar configuracao nao sensivel
+        run: |
+          set -euo pipefail
+          kubectl create configmap encurtai-config \
+            --namespace "$NS" \
+            --from-literal=public-base-url="$BASE_URL_PUBLICA" \
+            --from-literal=simular-falha-readiness="false" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Aplicar manifestos
+        env:
+          IMAGE_API: ${{ needs.imagens.outputs.api }}
+          IMAGE_WEB: ${{ needs.imagens.outputs.web }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/manifestos
+          cp k8s/*.yaml /tmp/manifestos/
+
+          # Fixa o digest resolvido no job anterior.
+          sed -i "s|__IMAGE_API__|${IMAGE_API}|g" /tmp/manifestos/api.yaml
+          sed -i "s|__IMAGE_WEB__|${IMAGE_WEB}|g" /tmp/manifestos/web.yaml
+
+          grep -n "image:" /tmp/manifestos/api.yaml /tmp/manifestos/web.yaml
+          kubectl apply --namespace "$NS" -f /tmp/manifestos/
+
+      - name: Aguardar banco e cache
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/encurtai-mongo --namespace "$NS" --timeout=180s
+          kubectl rollout status deployment/encurtai-redis --namespace "$NS" --timeout=120s
+
+      - name: Aguardar rollout da aplicacao
+        id: rollout
+        run: |
+          set -euo pipefail
+          # Com maxUnavailable=0 + readinessProbe, uma versao quebrada NUNCA fica
+          # ready e este comando estoura o timeout. E o gatilho do rollback.
+          kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=180s
+          kubectl rollout status deployment/encurtai-web --namespace "$NS" --timeout=180s
+
+      - name: Smoke test ponta a ponta
+        id: smoke
+        env:
+          VERSAO_ESPERADA: ${{ needs.imagens.outputs.versao }}
+        run: |
+          set -euo pipefail
+
+          kubectl port-forward --namespace "$NS" service/encurtai-web 18080:8080 &
+          pf=$!
+          trap 'kill $pf 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://localhost:18080/index.html"; then break; fi
+            sleep 2
+          done
+
+          echo "--- versao em execucao ---"
+          saude=$(curl -fsS "http://localhost:18080/api/health")
+          echo "$saude"
+          versao=$(printf '%s' "$saude" | jq -r .versao)
+          if [ "$versao" != "$VERSAO_ESPERADA" ]; then
+            echo "::error::A versao no ar ($versao) nao e a implantada ($VERSAO_ESPERADA)."
+            exit 1
+          fi
+
+          echo "--- encurtar ---"
+          destino="https://example.com/devops-entrega-2"
+          resposta=$(curl -fsS -X POST "http://localhost:18080/api/encurtar" \
+            -H 'Content-Type: application/json' \
+            -d "{\"url\":\"$destino\"}")
+          echo "$resposta"
+
+          codigo=$(printf '%s' "$resposta" | jq -r .codigo)
+          url_curta=$(printf '%s' "$resposta" | jq -r .urlCurta)
+
+          # Prova que a URL curta usa o endereco PUBLICO configurado e nao o
+          # hostname interno do pod -- o bug de containerizacao desta entrega.
+          case "$url_curta" in
+            "$BASE_URL_PUBLICA"/*)
+              echo "URL curta usa o BaseUrl configurado: $url_curta"
+              ;;
+            *)
+              echo "::error::URL curta nao usa o BaseUrl: $url_curta"
+              exit 1
+              ;;
+          esac
+
+          echo "--- resolver o redirecionamento ---"
+          destino_real=$(curl -fsS -o /dev/null -w '%{redirect_url}' "http://localhost:18080/$codigo")
+          if [ "$destino_real" != "$destino" ]; then
+            echo "::error::Redirect devolveu '$destino_real', esperado '$destino'."
+            exit 1
+          fi
+          echo "Redirect correto: $codigo -> $destino_real"
+
+          {
+            echo "### Smoke test de homologacao: aprovado"
+            echo ""
+            echo "- Versao no ar: \`$versao\`"
+            echo "- URL curta: \`$url_curta\`"
+            echo "- Redirect: \`$destino_real\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback automatico
+        # Dispara quando o rollout nao convergiu ou o smoke test reprovou.
+        if: failure() && (steps.rollout.outcome == 'failure' || steps.smoke.outcome == 'failure')
+        env:
+          VERSAO: ${{ needs.imagens.outputs.versao }}
+        run: |
+          set +e
+          echo "::warning::Deploy reprovado. Revertendo para a revisao anterior."
+
+          kubectl rollout history deployment/encurtai-api --namespace "$NS"
+          kubectl rollout undo deployment/encurtai-api --namespace "$NS"
+          kubectl rollout undo deployment/encurtai-web --namespace "$NS"
+          kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=120s
+
+          echo "--- estado apos a reversao ---"
+          kubectl get deployment,pod --namespace "$NS" -o wide
+          kubectl rollout history deployment/encurtai-api --namespace "$NS"
+
+          {
+            echo "### Rollback automatico executado"
+            echo ""
+            echo "A versao \`$VERSAO\` nao passou e foi revertida."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Coletar evidencias
+        if: always()
+        run: |
+          set +e
+          mkdir -p evidencias
+          kubectl get all --namespace "$NS" -o wide > evidencias/recursos.txt 2>&1
+          kubectl describe pods --namespace "$NS" > evidencias/pods.txt 2>&1
+          kubectl rollout history deployment/encurtai-api --namespace "$NS" > evidencias/historico-api.txt 2>&1
+          kubectl logs -l app.kubernetes.io/component=api --namespace "$NS" --tail=300 --all-containers > evidencias/logs-api.txt 2>&1
+          kubectl get events --namespace "$NS" --sort-by=.lastTimestamp > evidencias/eventos.txt 2>&1
+          # Confirma que o Secret existe e registra SO os nomes das chaves.
+          kubectl get secret encurtai-secrets --namespace "$NS" -o jsonpath='{.metadata.name}{"\n"}{.type}{"\n"}' > evidencias/secret.txt 2>&1
+          kubectl get secret encurtai-secrets --namespace "$NS" -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' >> evidencias/secret.txt 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidencias-homologacao-${{ github.run_number }}
+          path: evidencias
+          retention-days: 30
+
+  # ===========================================================================
+  # 3. Producao simulada: so por tag, e so depois de aprovacao humana.
+  #    O gate vem do Environment 'producao' com required reviewers.
+  # ===========================================================================
+  producao:
+    name: Deploy em producao (aprovacao manual)
+    needs: [imagens, homologacao]
+    # `always()` e obrigatorio aqui: no disparo manual para producao o job de
+    # homologacao e PULADO, e dependencia pulada pularia este job tambem.
+    # Entao: imagens tem que ter passado, homologacao tem que ter passado OU
+    # sido pulada, e o destino tem que ser producao.
+    if: |
+      always() &&
+      vars.CD_DEPLOY_HABILITADO == 'true' &&
+      needs.imagens.result == 'success' &&
+      (needs.homologacao.result == 'success' || needs.homologacao.result == 'skipped') &&
+      (github.ref_type == 'tag' ||
+       (github.event_name == 'workflow_dispatch' && inputs.ambiente == 'producao'))
+    runs-on: ubuntu-latest
+    environment: producao
+    permissions:
+      contents: read
+      packages: read
+    env:
+      NS: encurtai-producao
+      BASE_URL_PUBLICA: http://encurtai.producao.local
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Criar cluster kind
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: encurtai-prod
+          node_image: kindest/node:v1.31.0
+
+      - name: Preparar namespace, segredos e configuracao
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATOR: ${{ github.actor }}
+          MONGO_USER: ${{ secrets.MONGO_USER }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          MONGO_CONNECTION_STRING: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MONGO_CONNECTION_STRING:-}" ]; then
+            echo "::error::Environment 'producao' sem segredos. Veja docs/segredos.md."
+            exit 1
+          fi
+
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret docker-registry ghcr-pull --namespace "$NS" \
+            --docker-server="${REGISTRY}" \
+            --docker-username="${ATOR}" \
+            --docker-password="${GHCR_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic encurtai-secrets --namespace "$NS" \
+            --from-literal=mongo-user="$MONGO_USER" \
+            --from-literal=mongo-password="$MONGO_PASSWORD" \
+            --from-literal=mongo-connection-string="$MONGO_CONNECTION_STRING" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create configmap encurtai-config --namespace "$NS" \
+            --from-literal=public-base-url="$BASE_URL_PUBLICA" \
+            --from-literal=simular-falha-readiness="false" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Aplicar manifestos
+        env:
+          IMAGE_API: ${{ needs.imagens.outputs.api }}
+          IMAGE_WEB: ${{ needs.imagens.outputs.web }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/manifestos && cp k8s/*.yaml /tmp/manifestos/
+          sed -i "s|__IMAGE_API__|${IMAGE_API}|g" /tmp/manifestos/api.yaml
+          sed -i "s|__IMAGE_WEB__|${IMAGE_WEB}|g" /tmp/manifestos/web.yaml
+          kubectl apply --namespace "$NS" -f /tmp/manifestos/
+
+      - name: Aguardar rollout
+        id: rollout
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/encurtai-mongo --namespace "$NS" --timeout=180s
+          kubectl rollout status deployment/encurtai-redis --namespace "$NS" --timeout=120s
+          kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=180s
+          kubectl rollout status deployment/encurtai-web --namespace "$NS" --timeout=180s
+
+      - name: Verificar versao no ar
+        id: verificacao
+        env:
+          VERSAO_ESPERADA: ${{ needs.imagens.outputs.versao }}
+        run: |
+          set -euo pipefail
+          kubectl port-forward --namespace "$NS" service/encurtai-web 18081:8080 &
+          pf=$!
+          trap 'kill $pf 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://localhost:18081/index.html"; then break; fi
+            sleep 2
+          done
+
+          versao=$(curl -fsS "http://localhost:18081/api/health" | jq -r .versao)
+          echo "no ar: $versao | esperada: $VERSAO_ESPERADA"
+          [ "$versao" = "$VERSAO_ESPERADA" ]
+
+          echo "### Producao: versao \`$versao\` no ar" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rollback automatico
+        if: failure() && (steps.rollout.outcome == 'failure' || steps.verificacao.outcome == 'failure')
+        run: |
+          set +e
+          echo "::warning::Deploy de producao reprovado. Revertendo."
+          kubectl rollout undo deployment/encurtai-api --namespace "$NS"
+          kubectl rollout undo deployment/encurtai-web --namespace "$NS"
+          kubectl rollout status deployment/encurtai-api --namespace "$NS" --timeout=120s
+          kubectl rollout history deployment/encurtai-api --namespace "$NS"
+
+      - name: Coletar evidencias
+        if: always()
+        run: |
+          set +e
+          mkdir -p evidencias
+          kubectl get all --namespace "$NS" -o wide > evidencias/recursos.txt 2>&1
+          kubectl rollout history deployment/encurtai-api --namespace "$NS" > evidencias/historico-api.txt 2>&1
+          kubectl describe pods --namespace "$NS" > evidencias/pods.txt 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidencias-producao-${{ github.run_number }}
+          path: evidencias
+          retention-days: 30

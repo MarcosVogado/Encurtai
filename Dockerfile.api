@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+
+# =============================================================================
+# Encurtai.Api — ASP.NET Core Minimal API
+#
+# Build com contexto na RAIZ do repositório (docker build -f Dockerfile.api .),
+# porque a solução tem três projetos e o restore precisa enxergar todos.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Estágio 1: restore
+# Separado do build de propósito. Só os .csproj e os lockfiles entram aqui,
+# então a camada de restore (a mais lenta) sobrevive no cache enquanto nenhuma
+# dependência mudar — mudar código-fonte não invalida o download dos pacotes.
+# -----------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS restore
+WORKDIR /src
+
+COPY global.json Directory.Build.props Encurtai.sln ./
+COPY src/Encurtai.Api/Encurtai.Api.csproj src/Encurtai.Api/
+COPY src/Encurtai.Web/Encurtai.Web.csproj src/Encurtai.Web/
+COPY tests/Encurtai.Tests/Encurtai.Tests.csproj tests/Encurtai.Tests/
+
+# Restaura somente a API: a imagem não precisa do Blazor nem dos testes.
+# Para exigir lockfile determinístico, acrescente a flag de modo travado aqui
+# depois de confirmar no CI que o lockfile gerado no Windows serve ao Linux.
+RUN dotnet restore src/Encurtai.Api/Encurtai.Api.csproj
+
+# -----------------------------------------------------------------------------
+# Estágio 2: publish
+# NÃO roda testes: três testes exigem um MongoDB no ar (categoria Integration) e
+# o build do container não tem banco. Teste é responsabilidade do pipeline.
+# -----------------------------------------------------------------------------
+FROM restore AS publish
+ARG APP_VERSION=0.0.0
+
+COPY src/Encurtai.Api/ src/Encurtai.Api/
+
+# InvariantGlobalization dispensa a ICU, que não vem na imagem runtime alpine.
+# Seguro aqui: o app não faz comparação nem formatação sensível a cultura.
+RUN dotnet publish src/Encurtai.Api/Encurtai.Api.csproj \
+    --configuration Release \
+    --no-restore \
+    --output /app \
+    -p:Version=${APP_VERSION} \
+    -p:InvariantGlobalization=true
+
+# -----------------------------------------------------------------------------
+# Estágio 3: runtime
+# -----------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:9.0-alpine AS final
+
+ARG APP_VERSION=0.0.0
+LABEL org.opencontainers.image.title="encurtai-api" \
+      org.opencontainers.image.description="API do encurtador de URLs Encurtai" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.source="https://github.com/MarcosVogado/Encurtai" \
+      org.opencontainers.image.licenses="MIT"
+
+WORKDIR /app
+COPY --from=publish /app ./
+
+# A porta 5080 do launchSettings.json é só de desenvolvimento e não é copiada
+# pelo publish. Dentro do container a porta é fixada explicitamente.
+ENV ASPNETCORE_HTTP_PORTS=8080 \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    DOTNET_gcServer=1
+
+EXPOSE 8080
+
+# $APP_UID é o usuário sem privilégio que já vem nas imagens .NET 8+.
+USER $APP_UID
+
+# Liveness no próprio container. Usa o wget do busybox, presente no alpine.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD wget -q -O - http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["dotnet", "Encurtai.Api.dll"]

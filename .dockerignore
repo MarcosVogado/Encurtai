@@ -1,0 +1,43 @@
+# Contexto de build enxuto: menos bytes enviados ao daemon e, principalmente,
+# nenhum artefato de build do host vazando para dentro da imagem.
+
+# Saídas de compilação do host (se copiadas, conflitam com o build do container)
+**/bin/
+**/obj/
+**/TestResults/
+**/*.trx
+**/coverage.*
+
+# Git e CI
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Projeto alheio ao encurtador, depositado nesta pasta
+dashboard/
+
+# IDE e sistema operacional
+.vs/
+.idea/
+.vscode/
+**/*.user
+**/*.suo
+**/.DS_Store
+Thumbs.db
+
+# Segredos locais: nunca devem entrar em camada de imagem
+.env
+.env.*
+!.env.example
+**/appsettings.*.local.json
+**/secrets.json
+**/*.pem
+**/*.pfx
+**/*.key
+
+# Documentação e orquestração não fazem parte do runtime
+docs/
+k8s/
+*.md
+docker-compose*.yml

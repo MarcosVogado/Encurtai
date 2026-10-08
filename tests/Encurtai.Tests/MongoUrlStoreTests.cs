@@ -1,4 +1,4 @@
-﻿using Encurtai.Api.Services;
+using Encurtai.Api.Services;
 using MongoDB.Driver;
 using Xunit;
 

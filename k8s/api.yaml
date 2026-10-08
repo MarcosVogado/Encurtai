@@ -1,0 +1,121 @@
+# API do Encurtai.
+#
+# Este é o manifesto que torna o rollback REAL, não encenado:
+#   readinessProbe  -> uma versão que não fala com o Mongo nunca fica "ready"
+#   maxUnavailable 0 -> o pod antigo só sai depois que o novo está ready
+# Resultado: uma versão quebrada não recebe uma única requisição, o rollout
+# estoura o timeout e o pipeline reverte.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: encurtai-api
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: encurtai
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: encurtai
+        app.kubernetes.io/component: api
+    spec:
+      # Criado pelo pipeline a partir do GITHUB_TOKEN; permite baixar a imagem
+      # privada do GHCR sem tornar o pacote público.
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: api
+          # Substituído pelo pipeline pelo DIGEST da imagem (sha256:...), não
+          # pela tag: tag é ponteiro móvel, digest é imutável.
+          image: __IMAGE_API__
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: Mongo__Database
+              value: encurtai
+            - name: ConnectionStrings__Redis
+              value: encurtai-redis:6379
+            - name: Encurtai__BaseUrl
+              valueFrom:
+                configMapKeyRef:
+                  name: encurtai-config
+                  key: public-base-url
+            - name: Encurtai__SimularFalhaDeReadiness
+              valueFrom:
+                configMapKeyRef:
+                  name: encurtai-config
+                  key: simular-falha-readiness
+            - name: ConnectionStrings__Mongo
+              valueFrom:
+                secretKeyRef:
+                  name: encurtai-secrets
+                  key: mongo-connection-string
+          # Liveness NÃO toca no banco de propósito: se o Mongo cair, reiniciar
+          # a API não resolve nada e viraria um CrashLoop inútil.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness verifica o Mongo: quem não consegue falar com o banco sai
+          # do balanceamento em vez de responder erro ao usuário.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: encurtai-api
+  labels:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: encurtai
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

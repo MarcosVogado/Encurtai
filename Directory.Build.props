@@ -1,0 +1,25 @@
+<Project>
+
+  <!--
+    Propriedades compartilhadas pelos três projetos da solução.
+
+    Version é a fonte única do versionamento semântico: o pipeline injeta o valor
+    da tag git com -p:Version=1.2.3, e a API devolve esse número em GET /health.
+    É o que torna um rollback verificável com curl, e não só com print de pipeline.
+  -->
+  <PropertyGroup>
+    <Version Condition="'$(Version)' == ''">1.1.0</Version>
+
+    <!--
+      Gera packages.lock.json a cada restore. Com os lockfiles versionados, o
+      restore passa a ser determinístico e a camada de restore do Docker fica
+      confiável.
+
+      Para EXIGIR o lockfile (falhar quando estiver desatualizado), acrescente a
+      flag "locked-mode" ao restore do CI e do Dockerfile. Faça isso só depois de
+      confirmar no CI que o lockfile gerado no Windows serve ao build Linux.
+    -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+</Project>
